@@ -1,0 +1,8 @@
+runs/
+data/nerf_synthetic/
+data/lego/
+__pycache__/
+.pytest_cache/
+*.ply
+results/**/point_cloud.ply
+results/hashnerf_lego/*.pt

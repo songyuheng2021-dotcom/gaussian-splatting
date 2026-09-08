@@ -1,0 +1,9 @@
+torch>=2.0
+gsplat>=1.3
+lpips
+imageio
+scikit-image
+numpy
+matplotlib
+pillow
+pytest

@@ -1,0 +1,8 @@
+torch>=2.0
+numpy
+scikit-image
+open3d
+imageio
+pillow
+matplotlib
+pytest
