@@ -111,3 +111,20 @@ def test_colmap_text_reader(tmp_path):
     assert intrinsics(cams[1])[0, 2] == 50.0
     assert [im["name"] for im in ims] == ["a.jpg", "b.jpg"] and np.allclose(ims[1]["w2c"][:3, 3], [0.1, 0.2, 0.3])
     assert xyz.shape == (1, 3) and rgb[0, 0] == 1.0
+
+
+def test_floater_mask_flags_gaussians_in_front_of_lidar_surface():
+    from gs.lidar import floater_mask, prune_gaussians
+    # LiDAR "surface": a plane of points at z=0 (5 m from the camera); two Gaussians on it, one 1 m in front
+    g = torch.stack(torch.meshgrid(torch.linspace(-2, 2, 41), torch.linspace(-2, 2, 41), indexing="ij"), -1).reshape(-1, 2)
+    plane = torch.cat([g, torch.zeros(len(g), 1)], 1)
+    cams = [_cam(dist=5.0), _cam(dist=5.0)]
+    cams[1].w2c[0, 3] = 0.3                                  # second view shifted sideways
+    attach_lidar_depth(cams, plane, splat=2, verbose=False)
+    means = torch.tensor([[0.0, 0, 0], [0.5, 0.5, 0], [0.0, 0, -1.0]])   # third sits 1 m in front (closer to camera)
+    flag, n_checked = floater_mask(means, cams, thr=0.5, min_views=2)
+    assert flag.tolist() == [False, False, True]
+    assert (n_checked >= 2).all()
+    m = GaussianModel(means, torch.rand(3, 3), init_scale=0.2)
+    m = prune_gaussians(m, ~flag)
+    assert m.n == 2 and m.sh.shape[0] == 2 and m.grad_accum.shape[0] == 2
