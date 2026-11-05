@@ -107,11 +107,11 @@ def geometry_metrics(rec, ref, taus=(0.02, 0.05, 0.1, 0.2), ref_normals=None, ma
     the reconstruction; p2pl: point-to-plane distance of every rec point (None without normals).
     Use summarize_distances() to re-aggregate these over subsets (e.g. held-out blocks) so that a
     point near a subset border still finds its true nearest neighbour."""
-    d_rec = nn_distances(rec, ref)          # accuracy side
-    d_ref = nn_distances(ref, rec)          # completeness side
+    tree_ref = cKDTree(np.asarray(ref))
+    d_rec, idx = tree_ref.query(np.asarray(rec), k=1, workers=-1)   # accuracy side (index reused below)
+    d_ref = nn_distances(ref, rec)                                  # completeness side
     p2pl = None
     if ref_normals is not None:
-        _, idx = cKDTree(ref).query(rec, k=1)
         p2pl = np.abs(((rec - ref[idx]) * ref_normals[idx]).sum(1))
     return summarize_distances(d_rec, d_ref, taus, p2pl, max_dist), d_rec, d_ref, p2pl
 
