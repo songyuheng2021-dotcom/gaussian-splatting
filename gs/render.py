@@ -61,7 +61,11 @@ def project(model, w2c, K):
     return means2d, cov2d, z, colors
 
 
-def render_reference(model, cam, bg=(1.0, 1.0, 1.0), chunk_px=4096):
+def render_reference(model, cam, bg=(1.0, 1.0, 1.0), chunk_px=4096, return_depth=False):
+    """With return_depth=True, info also carries 'depth' (H,W): the expected depth
+    sum_i w_i z_i / sum_i w_i along each pixel (z = camera-frame depth of the Gaussian
+    centre), and 'acc' (H,W): the accumulated opacity sum_i w_i. Pixels with small acc
+    are background and their depth is meaningless; callers mask on acc."""
     w2c, K, H, W = cam.w2c, cam.K, cam.H, cam.W
     means2d, cov2d, depth, colors = project(model, w2c, K)
     if means2d.requires_grad:
@@ -78,11 +82,11 @@ def render_reference(model, cam, bg=(1.0, 1.0, 1.0), chunk_px=4096):
     visible = in_front & on_screen
     order = torch.argsort(depth)                                   # front to back
     order = order[visible[order]]
-    m2, iv, op, col = means2d[order], inv[order], opac[order], colors[order]
+    m2, iv, op, col, dz = means2d[order], inv[order], opac[order], colors[order], depth[order]
     ys, xs = torch.meshgrid(torch.arange(H, device=depth.device), torch.arange(W, device=depth.device), indexing="ij")
     px = torch.stack([xs, ys], -1).reshape(-1, 2).float() + 0.5
     bg_t = torch.tensor(bg, device=depth.device)
-    out = []
+    out, out_d, out_a = [], [], []
     for i in range(0, px.shape[0], chunk_px):
         d = px[i:i + chunk_px, None, :] - m2[None]                 # (P,N,2)
         power = -0.5 * (iv[None, :, 0, 0] * d[..., 0] ** 2 + iv[None, :, 1, 1] * d[..., 1] ** 2
@@ -92,16 +96,25 @@ def render_reference(model, cam, bg=(1.0, 1.0, 1.0), chunk_px=4096):
         T = torch.cumprod(1 - alpha, dim=1)
         T = torch.cat([torch.ones_like(T[:, :1]), T[:, :-1]], 1)  # transmittance before each Gaussian
         w = alpha * T
-        rgb = w @ col + (1 - w.sum(1, keepdim=True)) * bg_t
+        acc = w.sum(1, keepdim=True)
+        rgb = w @ col + (1 - acc) * bg_t
         out.append(rgb)
+        if return_depth:
+            out_d.append((w @ dz[:, None]) / acc.clamp(min=1e-6))
+            out_a.append(acc)
     img = torch.cat(out).reshape(H, W, 3)
     info = dict(means2d=means2d, radii=radii, visible=visible, n_visible=int(visible.sum()))
+    if return_depth:
+        info["depth"] = torch.cat(out_d).reshape(H, W)
+        info["acc"] = torch.cat(out_a).reshape(H, W)
     return img, info
 
 
-def render_gsplat(model, cam, bg=(1.0, 1.0, 1.0), absgrad=False):
+def render_gsplat(model, cam, bg=(1.0, 1.0, 1.0), absgrad=False, return_depth=False):
     """absgrad=True (AbsGS) needs a ~4x higher densification threshold (gsplat docs: 8e-4); we keep
-    the paper's averaged gradient with 2e-4 by default."""
+    the paper's averaged gradient with 2e-4 by default.
+    return_depth=True uses render_mode 'RGB+ED' so the 4th channel is gsplat's expected depth
+    (alpha-normalised, same definition as the reference rasteriser); 'acc' comes from alphas."""
     from gsplat import rasterization
     dev = model.means.device
     bg_t = torch.tensor(bg, device=dev)[None]
@@ -109,14 +122,19 @@ def render_gsplat(model, cam, bg=(1.0, 1.0, 1.0), absgrad=False):
         means=model.means, quats=model.quats, scales=model.scales(), opacities=model.opacities(),
         colors=model.sh, viewmats=cam.w2c[None].to(dev), Ks=cam.K[None].to(dev), width=cam.W, height=cam.H,
         sh_degree=model.active_sh_degree, backgrounds=bg_t, packed=False, absgrad=absgrad,
-        near_plane=0.01, far_plane=1e10, render_mode="RGB", rasterize_mode="classic")
+        near_plane=0.01, far_plane=1e10, render_mode="RGB+ED" if return_depth else "RGB",
+        rasterize_mode="classic")
     if info["means2d"].requires_grad:
         info["means2d"].retain_grad()
     radii = info["radii"][0]                                   # (N,) in gsplat<=1.4, (N,2) in >=1.5
     visible = (radii > 0).all(-1) if radii.dim() == 2 else radii > 0
     radii = radii.max(-1).values if radii.dim() == 2 else radii
-    return renders[0], dict(means2d=info["means2d"], radii=radii, visible=visible,
-                            n_visible=int(visible.sum()), absgrad=absgrad)
+    out = dict(means2d=info["means2d"], radii=radii, visible=visible, n_visible=int(visible.sum()), absgrad=absgrad)
+    if return_depth:
+        out["depth"] = renders[0, ..., 3]
+        out["acc"] = alphas[0, ..., 0]
+        return renders[0, ..., :3], out
+    return renders[0], out
 
 
 def grad2d_norm(info, W, H):
@@ -128,7 +146,7 @@ def grad2d_norm(info, W, H):
     if g.dim() == 3:
         g = g[0]
     g = g.clone()
-    g[:, 0] *= 0.5 * W; g[:, 1] *= 0.5 * H          # gsplat gives NDC gradients; reference gives pixels
+    g[:, 0] *= 0.5 * W; g[:, 1] *= 0.5 * H          # both backends give pixel-space gradients; this converts to NDC (paper threshold 2e-4)
     return g.norm(dim=-1)
 
 
