@@ -6,3 +6,6 @@ __pycache__/
 *.ply
 results/**/point_cloud.ply
 results/hashnerf_lego/*.pt
+
+data/synthetic/
+runs/
