@@ -79,3 +79,52 @@ def depth_error_stats(pred_depth, acc, lidar_depth, acc_min=0.5):
         return dict(n=int(m.sum()), abs_mean=float(e.mean()), abs_median=float(e.median()),
                     rel_mean=float((e / lidar_depth[m]).mean()),
                     supervised_frac=float(m.float().mean()), lidar_frac=float((lidar_depth > 0).float().mean()))
+
+
+@torch.no_grad()
+def floater_mask(means, cams, thr, min_views=2, min_frac=0.5, z_near=0.05):
+    """Post-training floater detection against the sparse LiDAR depth already attached to `cams`.
+
+    For every Gaussian centre, in every training view where its pixel carries a LiDAR depth,
+    compare the centre's camera-space z with the LiDAR z. A Gaussian is flagged as a floater when
+    it was checked in at least `min_views` views and in at least `min_frac` of those checks it sits
+    more than `thr` metres *in front of* the LiDAR surface (behind-surface Gaussians are occluded
+    and do not reach the rendered depth, so they are left alone).
+
+    Returns (flag (N,) bool tensor, n_checked (N,) long tensor). Only uses the supervision cloud,
+    so held-out blocks remain a fair test of what pruning does where no LiDAR was available.
+    """
+    N = means.shape[0]
+    dev = means.device
+    n_checked = torch.zeros(N, dtype=torch.long, device=dev)
+    n_front = torch.zeros(N, dtype=torch.long, device=dev)
+    for cam in cams:
+        if cam.depth is None:
+            continue
+        K, w2c = cam.K, cam.w2c
+        p = means @ w2c[:3, :3].T + w2c[:3, 3]
+        z = p[:, 2]
+        ok = z > z_near
+        u = (K[0, 0] * p[:, 0] / z.clamp(min=1e-6) + K[0, 2]).floor().long()
+        v = (K[1, 1] * p[:, 1] / z.clamp(min=1e-6) + K[1, 2]).floor().long()
+        ok &= (u >= 0) & (u < cam.W) & (v >= 0) & (v < cam.H)
+        d_l = torch.zeros(N, device=dev)
+        d_l[ok] = cam.depth[v[ok], u[ok]]
+        has = ok & (d_l > 0)
+        n_checked += has.long()
+        n_front += (has & (z < d_l - thr)).long()
+    flag = (n_checked >= min_views) & (n_front.float() >= min_frac * n_checked.float().clamp(min=1))
+    return flag, n_checked
+
+
+@torch.no_grad()
+def prune_gaussians(model, keep):
+    """Drop rows of every parameter of a trained GaussianModel (no optimiser involved)."""
+    import torch.nn as nn
+    for name in ("means", "log_scales", "quats", "opacity_logits", "sh"):
+        setattr(model, name, nn.Parameter(getattr(model, name).data[keep].contiguous()))
+    n = model.n; dev = model.means.device
+    model.grad_accum = torch.zeros(n, device=dev)
+    model.grad_count = torch.zeros(n, device=dev)
+    model.max_radii = torch.zeros(n, device=dev)
+    return model
