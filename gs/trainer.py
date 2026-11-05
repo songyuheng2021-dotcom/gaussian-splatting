@@ -30,6 +30,11 @@ class Config:
     densify = True          # ablation switch
     sh_max = 3              # ablation: 0 = view-independent colour
     log_every = 100
+    # ---- LiDAR depth supervision (gs/lidar.py); 0 disables it and the trainer never renders depth
+    lambda_depth = 0.0
+    depth_from = 0          # iteration from which the depth term is active
+    depth_acc_min = 0.5     # only pixels the model renders as at least this opaque are supervised
+    depth_scale = 1.0       # median LiDAR depth of the scene (set by the caller) so lambda_depth is unit-free
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -54,7 +59,9 @@ def train(train_cams, test_cams, init_xyz, init_rgb, out, cfg=None, device="cuda
     extent = scene_extent(train_cams)
     model = GaussianModel(init_xyz, init_rgb, sh_degree=cfg.sh_max).to(device)
     for c in train_cams + test_cams:
-        c.image, c.w2c, c.K = c.image.to(device), c.w2c.to(device), c.K.to(device)
+        c.to(device)
+    use_depth = cfg.lambda_depth > 0 and any(c.depth is not None for c in train_cams)
+    depth_log = []
     opt = torch.optim.Adam(model.param_groups(lr_schedule(0, cfg, extent)), eps=1e-15)
     bg = (1.0, 1.0, 1.0) if cfg.white_bg else (0.0, 0.0, 0.0)
     log, t0 = [], time.time()
@@ -68,8 +75,15 @@ def train(train_cams, test_cams, init_xyz, init_rgb, out, cfg=None, device="cuda
         for g in opt.param_groups:
             if g["name"] == "means":
                 g["lr"] = lr_schedule(it, cfg, extent)
-        img, info = render(model, cam, backend=backend, bg=bg)
+        want_depth = use_depth and cam.depth is not None and it >= cfg.depth_from
+        img, info = render(model, cam, backend=backend, bg=bg, return_depth=want_depth)
         loss, l1 = rgb_loss(img, cam.image, cfg.lambda_dssim)
+        if want_depth:
+            from .lidar import depth_loss
+            ld, n_sup = depth_loss(info["depth"], info["acc"], cam.depth, cfg.depth_acc_min, cfg.depth_scale)
+            loss = loss + cfg.lambda_depth * ld
+            if it % cfg.log_every == 0:
+                depth_log.append(dict(it=it, depth_l1_scaled=float(ld), n_supervised=n_sup))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         # ---- density control
@@ -94,7 +108,9 @@ def train(train_cams, test_cams, init_xyz, init_rgb, out, cfg=None, device="cuda
             m = evaluate(model, test_cams[:5], backend=backend, bg=bg)
             print(f"  VAL @{it}: {m}", flush=True)
     json.dump(log, open(f"{out}/train_log.json", "w"))
-    return model, log, dict(train_time_min=(time.time() - t0) / 60, extent=extent)
+    if depth_log:
+        json.dump(depth_log, open(f"{out}/depth_log.json", "w"))
+    return model, log, dict(train_time_min=(time.time() - t0) / 60, extent=extent, depth_supervised=use_depth)
 
 
 @torch.no_grad()
