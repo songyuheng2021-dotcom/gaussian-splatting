@@ -107,6 +107,11 @@ def main():
     ap.add_argument("--align", action="store_true", help="Sim(3)-ICP align fused points to the reference before scoring")
     ap.add_argument("--eval_only", action="store_true"); ap.add_argument("--ply", default=None)
     ap.add_argument("--no_lpips", action="store_true")
+    ap.add_argument("--prune_lidar", type=float, default=0.0,
+                    help="after training, drop Gaussians sitting more than this many metres in front of the LiDAR depth "
+                         "in most views where they are checked (0 = off). Uses only the supervision cloud.")
+    ap.add_argument("--prune_min_views", type=int, default=2)
+    ap.add_argument("--tolerances", default="0.05,0.1,0.2", help="acceptance table is also reported at these tolerances")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     json.dump(vars(a), open(f"{a.out}/args.json", "w"), indent=1)
@@ -147,6 +152,22 @@ def main():
         model, log, info = train(train_cams, test_cams, xyz0, rgb0, a.out, cfg, device=a.device, backend=a.backend, seed=a.seed)
         model.save_ply(f"{a.out}/point_cloud.ply")
 
+    # ---- optional post-training floater pruning against the sparse LiDAR depth
+    prune_info = None
+    if a.prune_lidar > 0:
+        from gs.lidar import floater_mask, prune_gaussians
+        for c in train_cams:
+            c.to(a.device)
+        if not any(c.depth is not None for c in train_cams):
+            attach_lidar_depth(train_cams, sup, splat=a.splat)
+        flag, n_checked = floater_mask(model.means.data, train_cams, a.prune_lidar, a.prune_min_views)
+        n_before = model.n
+        model = prune_gaussians(model, ~flag)
+        prune_info = dict(thr_m=a.prune_lidar, min_views=a.prune_min_views, n_before=int(n_before), n_pruned=int(flag.sum()),
+                          frac_pruned=float(flag.float().mean()), frac_checked=float((n_checked >= a.prune_min_views).float().mean()))
+        print("PRUNE", prune_info)
+        model.save_ply(f"{a.out}/point_cloud_pruned.ply")
+
     # ---- image metrics
     lp = None
     if not a.no_lpips:
@@ -184,18 +205,20 @@ def main():
     view_err = view_depth_errors(model, test_cams, gt, a.backend, a.acc_min, bg, a.splat)
     grid = error_grid(rec, np.minimum(d_rec, a.max_dist), a.cell)
     accept = acceptance_table(grid, a.tolerance)
+    accept_multi = {str(t): acceptance_table(grid, float(t)) for t in a.tolerances.split(",")}
     np.savez_compressed(f"{a.out}/error_grid.npz", count=grid["count"], mean=grid["mean"], p90=grid["p90"], origin=grid["origin"], cell=grid["cell"])
     save_heatmap(grid, f"{a.out}/error_heatmap.png", os.path.basename(a.out), vmax=a.max_dist * 0.5)
     o3d.io.write_point_cloud(f"{a.out}/fused_points.ply", o3d.geometry.PointCloud(o3d.utility.Vector3dVector(rec)))
 
     out = dict(scene=os.path.basename(a.data.rstrip("/")), image=img_metrics, geometry=geo, test_view_depth=view_err,
-               acceptance=accept, fusion=dict(n_raw=int(n_raw), n_fused=int(len(rec)), frac_outside_bbox=frac_outside, acc_min=a.acc_min, stride=a.stride, voxel=a.fuse_voxel),
+               acceptance=accept, acceptance_by_tolerance=accept_multi, prune=prune_info, fusion=dict(n_raw=int(n_raw), n_fused=int(len(rec)), frac_outside_bbox=frac_outside, acc_min=a.acc_min, stride=a.stride, voxel=a.fuse_voxel),
                supervision=info_sup, align=align_info, train=info, geometry_eval_min=(time.time() - t0) / 60,
                config=cfg.todict(), n_train=len(train_cams), n_test=len(test_cams), resolution=[train_cams[0].W, train_cams[0].H])
     json.dump(out, open(f"{a.out}/metrics.json", "w"), indent=1)
     g = geo_all
     print(f"GEOMETRY all: acc_mean {g['acc_mean']:.4f} m  comp_mean {g['comp_mean']:.4f} m  F@{taus[1]} {g[f'fscore@{taus[1]}']:.3f}  "
           f"p2plane_median {g.get('p2plane_median', float('nan')):.4f} m | cells pass {accept['cells_pass']}/{accept['cells_total']} at {a.tolerance} m")
+    print("ACCEPTANCE " + "  ".join(f"{t}m: {v['cells_pass']}/{v['cells_total']}" for t, v in accept_multi.items()))
     if "heldout_blocks" in geo:
         h = geo["heldout_blocks"]; s_ = geo["supervised_blocks"]
         print(f"  held-out blocks acc_mean {h['acc_mean']:.4f}  supervised blocks acc_mean {s_['acc_mean']:.4f}")
