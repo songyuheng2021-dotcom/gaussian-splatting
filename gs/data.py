@@ -22,6 +22,13 @@ class Camera:
     def __init__(self, image, w2c, K, name=""):
         self.image, self.w2c, self.K, self.name = image, w2c, K, name
         self.H, self.W = image.shape[:2]
+        self.depth = None        # optional sparse LiDAR depth (H,W), 0 where unobserved (see gs/lidar.py)
+
+    def to(self, device):
+        self.image, self.w2c, self.K = self.image.to(device), self.w2c.to(device), self.K.to(device)
+        if self.depth is not None:
+            self.depth = self.depth.to(device)
+        return self
 
 
 def opengl_to_opencv(c2w):
@@ -71,8 +78,39 @@ def load_scene(root, split="train", downscale=1, white_bg=True, max_images=None)
     return cams
 
 
+def load_colmap_scene(root, split="train", downscale=1, max_images=None, holdout_every=8, model_dir="colmap"):
+    """A scene laid out as  root/colmap/{cameras,images,points3D}.txt + root/images/<name>.
+    Every `holdout_every`-th image (sorted by name) is the test split, as in Mip-NeRF 360 / 3DGS.
+    Intrinsics are scaled by 1/downscale; images are resized with LANCZOS."""
+    from .colmap import read_model, intrinsics
+    cams_meta, ims, _ = read_model(os.path.join(root, model_dir))
+    ims = [im for i, im in enumerate(ims) if (i % holdout_every == 0) == (split == "test")]
+    if max_images:
+        ims = ims[:max_images]
+    cams = []
+    for im in ims:
+        p = os.path.join(root, "images", im["name"])
+        pil = Image.open(p).convert("RGB")
+        meta = cams_meta[im["camera_id"]]
+        sx, sy = pil.width / meta["width"], pil.height / meta["height"]   # images on disk may be pre-downscaled
+        if downscale > 1:
+            pil = pil.resize((pil.width // downscale, pil.height // downscale), Image.LANCZOS)
+            sx, sy = pil.width / meta["width"], pil.height / meta["height"]
+        rgb = np.asarray(pil, dtype=np.float32) / 255.0
+        K = intrinsics(meta).astype(np.float32)
+        K[0] *= sx; K[1] *= sy
+        cams.append(Camera(torch.from_numpy(rgb), torch.from_numpy(im["w2c"].astype(np.float32)), torch.from_numpy(K), im["name"]))
+    return cams
+
+
 def load_init_points(root, n_random=100_000, bound=1.3, seed=0):
-    """Initial Gaussian centres: COLMAP sparse points if available, else random in a cube."""
+    """Initial Gaussian centres: COLMAP sparse points if available, else random in a cube.
+    Looks for root/points3d.ply, then root/colmap/points3D.txt."""
+    txt = os.path.join(root, "colmap", "points3D.txt")
+    if os.path.exists(txt) and not os.path.exists(os.path.join(root, "points3d.ply")):
+        from .colmap import read_points3d
+        xyz, rgb = read_points3d(txt)
+        return torch.from_numpy(xyz), torch.from_numpy(rgb)
     p = os.path.join(root, "points3d.ply")
     if os.path.exists(p):
         import open3d as o3d
