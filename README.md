@@ -9,6 +9,65 @@ LPIPS / FPS), standard `.ply` export, and a **readable pure-PyTorch reference ra
 (depth-sorted per-pixel alpha compositing) that reproduces the maths of the paper, is used by
 the unit tests and lets the whole pipeline run on a CPU at small resolution.
 
+## Extension (branch `aerial-geometry`): geometric acceptance of a splat against a laser reference, with sparse LiDAR depth supervision
+
+A rendered splat can score well on PSNR while its *geometry* is metres off; DJI Terra ships GS reconstruction
+but does not allow measuring on it for exactly this reason. This branch turns the training system into a
+geometry-acceptance pipeline and tests the most direct fix, sparse LiDAR depth as a training constraint.
+
+* **Depth rendering** in both backends: expected depth `D = Σ w_i z_i / Σ w_i` and accumulated opacity `A = Σ w_i`
+  (`gs/render.py`, `return_depth=True`; gsplat `RGB+ED`).
+* **Geometry evaluation** (`gs/geometry.py`, `run_geometry.py`): training-view depth → fused point cloud (2 cm voxels) →
+  accuracy / completeness / F-score at 2, 5, 10, 20 cm, point-to-plane distance against the laser normals,
+  a 1 m grid of mean and p90 error (heat map) and a pass/fail acceptance table at 5 / 10 / 20 cm tolerance;
+  Umeyama Sim(3) + ICP alignment for scenes whose pose frame differs from the laser frame.
+* **Sparse LiDAR supervision** (`gs/lidar.py`): the reference cloud is subsampled to 10 cm, z-buffer-projected into
+  every training view (2 px splat, 3.7 % of pixels covered), and a robust L1 between rendered and LiDAR depth,
+  normalised by the scene's median depth, is added with weight `--lambda_depth`.
+* **Spatial block hold-out**: 50 % of all 1 m blocks are hidden from supervision; metrics are reported for all /
+  supervised / held-out blocks so that an improvement can be told apart from copying the LiDAR back in.
+* Data tools for ETH3D high-res multi-view (`tools/prepare_eth3d.py`: merges the Faro scans via `scan_alignment.mlp`),
+  a CPU synthetic scene, covered-pixel PSNR re-scoring, multi-seed aggregation; 9 new unit tests (16 in total).
+
+### Results (ETH3D, images at 1/4 resolution, 30k iterations, Colab L4)
+
+courtyard (33 train / 5 test views, 3.5 M laser points); mean ± s.d. over 3 runs (seed 0 on two machines, seed 1):
+
+| | photos only | + LiDAR depth, λ = 0.5 |
+|---|---|---|
+| test-view PSNR | 15.75 ± 0.78 | 19.88 ± 0.21 |
+| mean distance to laser surface (acc_mean, clipped 1 m) | 0.691 ± 0.069 m | 0.236 ± 0.007 m |
+| F-score @ 10 cm | 0.087 ± 0.029 | 0.608 ± 0.017 |
+| test-view depth error | 1.90 ± 0.16 m | 0.23 ± 0.04 m |
+| acc_mean on blocks **hidden** from supervision | 0.699 ± 0.068 m | 0.234 ± 0.008 m |
+
+terrace (20 / 3 views, seed 0): acc_mean 0.805 → 0.289 m, comp_mean 0.440 → 0.051 m, F@10cm 0.045 → 0.580,
+test-view depth error 3.37 → 0.36 m, PSNR 18.0 → 20.5.
+
+λ sweep (seed 0): geometry improves monotonically with λ (courtyard acc_mean 0.77 / 0.37 / 0.24 / 0.20 m at
+λ = 0 / 0.1 / 0.5 / 2), image quality peaks at λ = 0.1 (21.0 dB) and drops ~1.4 dB by λ = 2.
+
+What the numbers do and do not say. Accuracy gains transfer to blocks without any LiDAR (hidden ≈ supervised in every
+constrained run); completeness only partially does (courtyard 0.081 vs 0.022 m). Post-training floater pruning against
+the sparse LiDAR depth changes the metrics by < 0.01 m because only ~10 % of Gaussians fall on a LiDAR-covered pixel
+(negative result, kept). The photo-only baseline is weak because these scenes are sparse-view (train PSNR 31–33 vs
+test 15–21; masking sky changes < 0.7 dB), so the PSNR gain should not be read as general. At 5 cm tolerance almost no
+1 m cell passes on either scene; the acceptance table only discriminates at 10–20 cm. Same-seed re-runs across
+machines moved the baseline by 0.12 m and the constrained run by 0.001 m, hence the multi-seed protocol.
+Not yet done: remaining seeds, the 76-view `facade` scene, training-time variants (`--depth_from`, `--splat 3`,
+`--lidar_voxel 0.05`), and aerial data (UAVScenes, M300 + Livox Avia, Terra-processed L1 reference).
+
+```bash
+python tools/prepare_eth3d.py --raw raw/courtyard --out data/eth3d/courtyard --downscale 4 --gt_voxel 0.02
+python run_geometry.py --data data/eth3d/courtyard --out runs/courtyard_base --lambda_depth 0      # baseline
+python run_geometry.py --data data/eth3d/courtyard --out runs/courtyard_d0p5 --lambda_depth 0.5    # LiDAR-constrained
+python tools/aggregate_runs.py --root runs                                                          # mean ± s.d. table
+```
+
+Outputs per run: `metrics.json` (image, geometry all / supervised / held-out, test-view depth, acceptance tables,
+supervision and fusion stats, full config), `error_heatmap.png`, `error_grid.npz`, `fused_points.ply`,
+`point_cloud.ply`, `test_renders/`.
+
 <p align="center">
 <img src="results/scenes/lego/turntable.gif" width="40%"/>&nbsp;
 <img src="results/scenes/ship/turntable.gif" width="40%"/>
