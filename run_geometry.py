@@ -25,24 +25,8 @@ from gs.data import load_colmap_scene, load_init_points, Camera
 from gs.trainer import Config, train, evaluate
 from gs.render import render
 from gs.geometry import (unproject_depth, voxel_downsample, geometry_metrics, summarize_distances, estimate_normals, error_grid,
-                         acceptance_table, icp_sim3, apply_sim3)
+                         acceptance_table, icp_sim3, apply_sim3, block_ids, holdout_mask, blockwise_metrics)
 from gs.lidar import attach_lidar_depth, project_points_to_depth, depth_error_stats
-
-
-def block_ids(xyz, block):
-    k = np.floor(np.asarray(xyz) / block).astype(np.int64)
-    return (k[:, 0] * 73856093) ^ (k[:, 1] * 19349663) ^ (k[:, 2] * 83492791)
-
-
-def holdout_mask(xyz, block, frac, seed):
-    """True for points in blocks hidden from supervision (deterministic per block id)."""
-    if frac <= 0:
-        return np.zeros(len(xyz), bool)
-    ids = block_ids(xyz, block)
-    rng = np.random.default_rng(seed)
-    uniq = np.unique(ids)
-    hidden = set(uniq[rng.random(len(uniq)) < frac].tolist())
-    return np.fromiter((i in hidden for i in ids), bool, len(ids))
 
 
 @torch.no_grad()
@@ -198,10 +182,7 @@ def main():
     geo_all, d_rec, d_ref, p2pl = geometry_metrics(rec, gt, taus, normals, a.max_dist)
     geo = dict(all=geo_all)
     if a.lidar_holdout > 0:
-        rec_hidden = holdout_mask(rec, a.block, a.lidar_holdout, a.seed)
-        for name, mr, mg in (("supervised_blocks", ~rec_hidden, ~hidden), ("heldout_blocks", rec_hidden, hidden)):
-            if mr.sum() > 100 and mg.sum() > 100:
-                geo[name] = summarize_distances(d_rec[mr], d_ref[mg], taus, p2pl[mr] if p2pl is not None else None, a.max_dist)
+        geo.update(blockwise_metrics(rec, gt, d_rec, d_ref, a.block, a.lidar_holdout, a.seed, taus, p2pl, a.max_dist))
     view_err = view_depth_errors(model, test_cams, gt, a.backend, a.acc_min, bg, a.splat)
     grid = error_grid(rec, np.minimum(d_rec, a.max_dist), a.cell)
     accept = acceptance_table(grid, a.tolerance)
