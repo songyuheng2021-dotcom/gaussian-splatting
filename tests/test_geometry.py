@@ -130,7 +130,7 @@ def test_floater_mask_flags_gaussians_in_front_of_lidar_surface():
     assert m.n == 2 and m.sh.shape[0] == 2 and m.grad_accum.shape[0] == 2
 
 def test_blockwise_metrics_use_full_cloud_neighbours_not_per_block_search():
-    from gs.geometry import holdout_mask, blockwise_metrics, block_ids
+    from gs.geometry import holdout_mask, blockwise_metrics, block_ids, hidden_blocks, in_blocks
     from scipy.spatial import cKDTree
     # a 20 m x 20 m flat reference on a 5 cm grid; reconstruction = reference shifted 4 cm along x, so every
     # point's true nearest neighbour is 1 cm away, and for points at x = k - 0.01 that neighbour lies across a
@@ -146,8 +146,31 @@ def test_blockwise_metrics_use_full_cloud_neighbours_not_per_block_search():
     # the reference and reconstruction agree on which blocks are hidden
     assert (holdout_mask(ref, 1.0, 0.5, 3) == holdout_mask(ref.copy(), 1.0, 0.5, 3)).all()
     # the naive per-block search (the old bug) is worse: border points lose their true neighbour
-    hr, hg = holdout_mask(rec, 1.0, 0.5, 3), holdout_mask(ref, 1.0, 0.5, 3)
+    _, hidden = hidden_blocks(ref, 1.0, 0.5, 3)
+    hr, hg = in_blocks(rec, 1.0, hidden), holdout_mask(ref, 1.0, 0.5, 3)
     naive = cKDTree(ref[hg]).query(rec[hr])[0].mean()
     assert naive > out["heldout_blocks"]["acc_mean"] + 5e-4      # 0.0108 vs 0.0101 m here
     # roughly half of the blocks are hidden
     assert 0.3 < hg.mean() < 0.7 and len(np.unique(block_ids(ref, 1.0))) == 400
+
+
+def test_heldout_split_is_defined_on_the_reference_and_survives_floaters():
+    """Regression: the block lottery used to run separately on rec and on ref. A reconstruction never occupies
+    exactly the reference's blocks, so the draws fell out of step and rec's 'held-out' half was arbitrary.
+    Here the reconstruction is exact in supervised blocks, 10 cm too high in held-out blocks, and has a floater
+    cluster in a block the reference does not occupy. A correct split must see 0 vs 0.10 m."""
+    from gs.geometry import blockwise_metrics, hidden_blocks, in_blocks, holdout_mask
+    g = np.stack(np.meshgrid(np.arange(0, 20, 0.05), np.arange(0, 20, 0.05), indexing="ij"), -1).reshape(-1, 2)
+    ref = np.c_[g, np.zeros(len(g))]
+    _, hidden = hidden_blocks(ref, 1.0, 0.5, 7)
+    rec = ref.copy(); rec[in_blocks(ref, 1.0, hidden), 2] += 0.10
+    floater = np.random.default_rng(0).uniform([5, 5, 10], [5.9, 5.9, 10.9], (300, 3))
+    rec = np.r_[floater, rec]                          # floaters first: shifts any per-cloud lottery
+    _, d_rec, d_ref, _ = geometry_metrics(rec, ref, taus=(0.05,), max_dist=1.0)
+    out = blockwise_metrics(rec, ref, d_rec, d_ref, block=1.0, frac=0.5, seed=7, taus=(0.05,), max_dist=1.0)
+    assert out["supervised_blocks"]["acc_mean"] < 1e-6
+    assert abs(out["heldout_blocks"]["acc_mean"] - 0.10) < 1e-6
+    assert abs(out["split"]["rec_frac_unassigned"] - 300 / len(rec)) < 1e-9
+    # what the old per-cloud lottery would have done: rec's own draw disagrees with the reference's split
+    old = holdout_mask(rec, 1.0, 0.5, 7)[300:]          # lottery re-run on rec's own blocks (incl. the floater's)
+    assert (old != in_blocks(rec[300:], 1.0, hidden)).mean() > 0.2
