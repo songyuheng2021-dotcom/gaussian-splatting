@@ -155,32 +155,57 @@ def block_ids(xyz, block):
     return (k[:, 0] * 73856093) ^ (k[:, 1] * 19349663) ^ (k[:, 2] * 83492791)
 
 
+def hidden_blocks(split_ref, block, frac, seed):
+    """Block lottery of the hold-out split, defined on ONE cloud (the reference the supervision was drawn from).
+    Returns (known, hidden): the sorted distinct block ids of split_ref and the subset hidden from supervision.
+    Each distinct block is hidden with probability frac; the draw is made in sorted-id order with default_rng(seed),
+    so the result depends on which blocks split_ref occupies. That is why every other cloud must be assigned by
+    membership in these two sets, never by re-running the lottery on its own blocks (see blockwise_metrics)."""
+    known = np.unique(block_ids(split_ref, block))
+    if frac <= 0:
+        return known, known[:0]
+    rng = np.random.default_rng(seed)
+    return known, known[rng.random(len(known)) < frac]
+
+
 def holdout_mask(xyz, block, frac, seed):
-    """True for points in blocks hidden from supervision. Each distinct block is hidden with
-    probability `frac`, decided by `seed`, so the reference and the reconstruction (same block size,
-    same seed) agree on which blocks are hidden."""
+    """True for points of xyz in blocks hidden from supervision, with the lottery run on xyz itself. Use this only
+    on the cloud that defines the split (the training reference); for any other cloud use in_blocks() with the
+    sets from hidden_blocks(reference, ...)."""
     if frac <= 0:
         return np.zeros(len(xyz), bool)
-    ids = block_ids(xyz, block)
-    rng = np.random.default_rng(seed)
-    uniq = np.unique(ids)
-    hidden = set(uniq[rng.random(len(uniq)) < frac].tolist())
-    return np.fromiter((i in hidden for i in ids), bool, len(ids))
+    _, hidden = hidden_blocks(xyz, block, frac, seed)
+    return np.isin(block_ids(xyz, block), hidden)
+
+
+def in_blocks(xyz, block, ids):
+    return np.isin(block_ids(xyz, block), ids)
 
 
 def blockwise_metrics(rec, ref, d_rec, d_ref, block, frac, seed, taus=(0.02, 0.05, 0.1, 0.2), p2pl=None,
-                      max_dist=None, min_points=100):
+                      max_dist=None, min_points=100, split_ref=None):
     """Split already-computed per-point distances into supervised / held-out blocks.
+
+    The split is defined on split_ref (default: ref), the cloud the training supervision was drawn from, and both
+    rec and ref are assigned to it by block membership. An earlier version ran the block lottery separately on rec
+    and on ref; because the two clouds never occupy exactly the same blocks (floaters, holes), the random draws fell
+    out of step and rec's "held-out" points were an arbitrary half of the reconstruction, not the hidden blocks.
+    Reconstructed points in blocks split_ref does not occupy belong to neither subset (reported as
+    rec_frac_unassigned; they are still in the all-points metrics).
 
     d_rec and d_ref MUST come from nearest-neighbour queries against the FULL other cloud
     (geometry_metrics). Re-running the NN search inside each subset would let a point near a block
-    border miss its true neighbour in the adjacent block and inflate both subsets' errors; an early
-    version of this pipeline did that. Returns {"supervised_blocks": {...}, "heldout_blocks": {...}}
+    border miss its true neighbour in the adjacent block and inflate both subsets' errors.
+    Returns {"supervised_blocks": {...}, "heldout_blocks": {...}, "split": {...}}
     (a subset is omitted when it has fewer than min_points on either side)."""
-    rec_hidden = holdout_mask(rec, block, frac, seed)
-    ref_hidden = holdout_mask(ref, block, frac, seed)
-    out = {}
-    for name, mr, mg in (("supervised_blocks", ~rec_hidden, ~ref_hidden), ("heldout_blocks", rec_hidden, ref_hidden)):
+    known, hidden = hidden_blocks(ref if split_ref is None else split_ref, block, frac, seed)
+    rec_ids, ref_ids = block_ids(rec, block), block_ids(ref, block)
+    rec_hidden, ref_hidden = np.isin(rec_ids, hidden), np.isin(ref_ids, hidden)
+    rec_sup, ref_sup = np.isin(rec_ids, known) & ~rec_hidden, np.isin(ref_ids, known) & ~ref_hidden
+    out = {"split": dict(n_blocks=int(len(known)), n_hidden=int(len(hidden)),
+                         rec_frac_unassigned=float(1 - (rec_hidden | rec_sup).mean()),
+                         ref_frac_unassigned=float(1 - (ref_hidden | ref_sup).mean()))}
+    for name, mr, mg in (("supervised_blocks", rec_sup, ref_sup), ("heldout_blocks", rec_hidden, ref_hidden)):
         if mr.sum() >= min_points and mg.sum() >= min_points:
             out[name] = summarize_distances(d_rec[mr], d_ref[mg], taus, p2pl[mr] if p2pl is not None else None, max_dist)
     return out
