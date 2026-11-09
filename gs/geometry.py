@@ -148,6 +148,44 @@ def estimate_normals(pts, radius=None, knn=30):
     return np.asarray(pc.normals)
 
 
+# ---------------------------------------------------------------- spatial block hold-out
+def block_ids(xyz, block):
+    """Integer id of the (block x block x block) cube each point falls in (spatial hash, no modulo)."""
+    k = np.floor(np.asarray(xyz) / block).astype(np.int64)
+    return (k[:, 0] * 73856093) ^ (k[:, 1] * 19349663) ^ (k[:, 2] * 83492791)
+
+
+def holdout_mask(xyz, block, frac, seed):
+    """True for points in blocks hidden from supervision. Each distinct block is hidden with
+    probability `frac`, decided by `seed`, so the reference and the reconstruction (same block size,
+    same seed) agree on which blocks are hidden."""
+    if frac <= 0:
+        return np.zeros(len(xyz), bool)
+    ids = block_ids(xyz, block)
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(ids)
+    hidden = set(uniq[rng.random(len(uniq)) < frac].tolist())
+    return np.fromiter((i in hidden for i in ids), bool, len(ids))
+
+
+def blockwise_metrics(rec, ref, d_rec, d_ref, block, frac, seed, taus=(0.02, 0.05, 0.1, 0.2), p2pl=None,
+                      max_dist=None, min_points=100):
+    """Split already-computed per-point distances into supervised / held-out blocks.
+
+    d_rec and d_ref MUST come from nearest-neighbour queries against the FULL other cloud
+    (geometry_metrics). Re-running the NN search inside each subset would let a point near a block
+    border miss its true neighbour in the adjacent block and inflate both subsets' errors; an early
+    version of this pipeline did that. Returns {"supervised_blocks": {...}, "heldout_blocks": {...}}
+    (a subset is omitted when it has fewer than min_points on either side)."""
+    rec_hidden = holdout_mask(rec, block, frac, seed)
+    ref_hidden = holdout_mask(ref, block, frac, seed)
+    out = {}
+    for name, mr, mg in (("supervised_blocks", ~rec_hidden, ~ref_hidden), ("heldout_blocks", rec_hidden, ref_hidden)):
+        if mr.sum() >= min_points and mg.sum() >= min_points:
+            out[name] = summarize_distances(d_rec[mr], d_ref[mg], taus, p2pl[mr] if p2pl is not None else None, max_dist)
+    return out
+
+
 # ---------------------------------------------------------------- per-cell acceptance map
 def error_grid(pts, err, cell, axes=(0, 1), min_count=20):
     """Top-down grid: for each (cell x cell) footprint in the two `axes`, mean error, 90th
