@@ -128,3 +128,26 @@ def test_floater_mask_flags_gaussians_in_front_of_lidar_surface():
     m = GaussianModel(means, torch.rand(3, 3), init_scale=0.2)
     m = prune_gaussians(m, ~flag)
     assert m.n == 2 and m.sh.shape[0] == 2 and m.grad_accum.shape[0] == 2
+
+def test_blockwise_metrics_use_full_cloud_neighbours_not_per_block_search():
+    from gs.geometry import holdout_mask, blockwise_metrics, block_ids
+    from scipy.spatial import cKDTree
+    # a 20 m x 20 m flat reference on a 5 cm grid; reconstruction = reference shifted 4 cm along x, so every
+    # point's true nearest neighbour is 1 cm away, and for points at x = k - 0.01 that neighbour lies across a
+    # 1 m block border
+    g = np.stack(np.meshgrid(np.arange(0, 20, 0.05), np.arange(0, 20, 0.05), indexing="ij"), -1).reshape(-1, 2)
+    ref = np.c_[g, np.zeros(len(g))]
+    rec = ref + np.array([0.04, 0.0, 0.0])
+    _, d_rec, d_ref, _ = geometry_metrics(rec, ref, taus=(0.02,))
+    out = blockwise_metrics(rec, ref, d_rec, d_ref, block=1.0, frac=0.5, seed=3, taus=(0.02,))
+    # both subsets see the true 1 cm error
+    for k in ("supervised_blocks", "heldout_blocks"):
+        assert abs(out[k]["acc_mean"] - 0.01) < 1e-3 and out[k]["fscore@0.02"] > 0.99
+    # the reference and reconstruction agree on which blocks are hidden
+    assert (holdout_mask(ref, 1.0, 0.5, 3) == holdout_mask(ref.copy(), 1.0, 0.5, 3)).all()
+    # the naive per-block search (the old bug) is worse: border points lose their true neighbour
+    hr, hg = holdout_mask(rec, 1.0, 0.5, 3), holdout_mask(ref, 1.0, 0.5, 3)
+    naive = cKDTree(ref[hg]).query(rec[hr])[0].mean()
+    assert naive > out["heldout_blocks"]["acc_mean"] + 5e-4      # 0.0108 vs 0.0101 m here
+    # roughly half of the blocks are hidden
+    assert 0.3 < hg.mean() < 0.7 and len(np.unique(block_ids(ref, 1.0))) == 400
