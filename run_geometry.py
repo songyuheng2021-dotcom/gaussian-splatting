@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--splat", type=int, default=2, help="pixel footprint of a projected LiDAR point")
     # geometry evaluation
     ap.add_argument("--gt", default=None, help="reference .ply (default <data>/gt_scan.ply)")
+    ap.add_argument("--split_ref", default=None,
+                    help="cloud that defines the supervised/held-out block split (default <data>/gt_scan.ply, the "
+                         "supervision source); set it when scoring against a second reference with --gt")
     ap.add_argument("--acc_min", type=float, default=0.5); ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--depth_max", type=float, default=None); ap.add_argument("--fuse_voxel", type=float, default=0.02)
     ap.add_argument("--taus", default="0.02,0.05,0.1,0.2"); ap.add_argument("--max_dist", type=float, default=1.0)
@@ -111,9 +114,13 @@ def main():
     print(f"train {len(train_cams)} test {len(test_cams)} {train_cams[0].W}x{train_cams[0].H}; init {len(xyz0)} pts; reference {len(gt)} pts")
 
     # ---- supervision cloud: subsampled reference minus held-out blocks
-    hidden = holdout_mask(gt, a.block, a.lidar_holdout, a.seed)
-    sup = voxel_downsample(gt[~hidden], a.lidar_voxel)
+    split_path = a.split_ref or os.path.join(a.data, "gt_scan.ply")
+    split_ref = gt if os.path.abspath(split_path) == os.path.abspath(gt_path) else \
+        np.asarray(o3d.io.read_point_cloud(split_path).points, dtype=np.float64)
+    hidden = holdout_mask(split_ref, a.block, a.lidar_holdout, a.seed)
+    sup = voxel_downsample(split_ref[~hidden], a.lidar_voxel)
     info_sup = dict(n_reference=int(len(gt)), n_supervision=int(len(sup)), holdout_frac_points=float(hidden.mean()),
+                    split_ref=split_path,
                     lidar_voxel=a.lidar_voxel, block=a.block)
     depth_scale = 1.0
     if a.lambda_depth > 0:
@@ -182,7 +189,8 @@ def main():
     geo_all, d_rec, d_ref, p2pl = geometry_metrics(rec, gt, taus, normals, a.max_dist)
     geo = dict(all=geo_all)
     if a.lidar_holdout > 0:
-        geo.update(blockwise_metrics(rec, gt, d_rec, d_ref, a.block, a.lidar_holdout, a.seed, taus, p2pl, a.max_dist))
+        geo.update(blockwise_metrics(rec, gt, d_rec, d_ref, a.block, a.lidar_holdout, a.seed, taus, p2pl, a.max_dist,
+                                     split_ref=split_ref))
     view_err = view_depth_errors(model, test_cams, gt, a.backend, a.acc_min, bg, a.splat)
     grid = error_grid(rec, np.minimum(d_rec, a.max_dist), a.cell)
     accept = acceptance_table(grid, a.tolerance)
