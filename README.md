@@ -24,44 +24,83 @@ geometry-acceptance pipeline and tests the most direct fix, sparse LiDAR depth a
 * **Sparse LiDAR supervision** (`gs/lidar.py`): the reference cloud is subsampled to 10 cm, z-buffer-projected into
   every training view (2 px splat, 3.7 % of pixels covered), and a robust L1 between rendered and LiDAR depth,
   normalised by the scene's median depth, is added with weight `--lambda_depth`.
-* **Spatial block hold-out**: 50 % of all 1 m blocks are hidden from supervision; metrics are reported for all /
-  supervised / held-out blocks so that an improvement can be told apart from copying the LiDAR back in.
-* Data tools for ETH3D high-res multi-view (`tools/prepare_eth3d.py`: merges the Faro scans via `scan_alignment.mlp`),
-  a CPU synthetic scene, covered-pixel PSNR re-scoring, multi-seed aggregation; 9 new unit tests (16 in total).
+* **Spatial block hold-out**: 50 % of all blocks are hidden from supervision; metrics are reported for all /
+  supervised / held-out blocks so that an improvement can be told apart from copying the LiDAR back in. The split is
+  drawn once on the supervision reference and both clouds are assigned to it by block membership.
+* Data tools for ETH3D high-res multi-view (`tools/prepare_eth3d.py`: merges the Faro scans via `scan_alignment.mlp`)
+  and for UAVScenes aerial runs (`tools/prepare_uavscenes.py`: DJI M300 RTK + Livox Avia; accumulates the Avia scans,
+  keeps the points at least two cameras see, measures the LiDAR map's repeatability from odd / even scans and crops the
+  DJI Terra map as a second reference), a CPU synthetic scene, covered-pixel PSNR re-scoring, multi-seed aggregation,
+  re-scoring of finished runs (`tools/rescore_heldout.py`); 18 unit tests in total.
 
-### Results (ETH3D, images at 1/4 resolution, 30k iterations, Colab L4)
+### Results (ETH3D, images at 1/4 resolution, 30k iterations)
 
-courtyard (33 train / 5 test views, 3.5 M laser points); mean ± s.d. over 3 runs (seed 0 on two machines, seed 1):
+courtyard (33 train / 5 test views, 3.5 M laser points); mean ± s.d. over 2 seeds:
 
 | | photos only | + LiDAR depth, λ = 0.5 |
 |---|---|---|
-| test-view PSNR | 15.75 ± 0.78 | 19.88 ± 0.21 |
-| mean distance to laser surface (acc_mean, clipped 1 m) | 0.691 ± 0.069 m | 0.236 ± 0.007 m |
-| F-score @ 10 cm | 0.087 ± 0.029 | 0.608 ± 0.017 |
-| test-view depth error | 1.90 ± 0.16 m | 0.23 ± 0.04 m |
-| acc_mean on blocks **hidden** from supervision | 0.699 ± 0.068 m | 0.234 ± 0.008 m |
+| test-view PSNR | 15.72 ± 1.10 | 19.89 ± 0.29 |
+| mean distance to laser surface (acc_mean, clipped 1 m) | 0.711 ± 0.083 m | 0.234 ± 0.009 m |
+| F-score @ 10 cm | 0.075 ± 0.028 | 0.614 ± 0.020 |
+| test-view depth error | 1.83 m | 0.22 m |
+| acc_mean, supervised blocks (seed 0 / seed 1) | 0.395 / 0.357 m | 0.126 / 0.117 m |
+| acc_mean, blocks **hidden** from supervision (seed 0 / seed 1) | 0.408 / 0.360 m | 0.178 / 0.164 m |
 
 terrace (20 / 3 views, seed 0): acc_mean 0.805 → 0.289 m, comp_mean 0.440 → 0.051 m, F@10cm 0.045 → 0.580,
-test-view depth error 3.37 → 0.36 m, PSNR 18.0 → 20.5.
+test-view depth error 3.37 → 0.36 m, PSNR 18.0 → 20.5; supervised / hidden blocks 0.531 / 0.481 m → 0.118 / 0.191 m.
 
-λ sweep (seed 0): geometry improves monotonically with λ (courtyard acc_mean 0.77 / 0.37 / 0.24 / 0.20 m at
+λ sweep (courtyard, seed 0): geometry improves monotonically with λ (acc_mean 0.77 / 0.37 / 0.24 / 0.20 m at
 λ = 0 / 0.1 / 0.5 / 2), image quality peaks at λ = 0.1 (21.0 dB) and drops ~1.4 dB by λ = 2.
 
-What the numbers do and do not say. Accuracy gains transfer to blocks without any LiDAR (hidden ≈ supervised in every
-constrained run); completeness only partially does (courtyard 0.081 vs 0.022 m). Post-training floater pruning against
-the sparse LiDAR depth changes the metrics by < 0.01 m because only ~10 % of Gaussians fall on a LiDAR-covered pixel
-(negative result, kept). The photo-only baseline is weak because these scenes are sparse-view (train PSNR 31–33 vs
-test 15–21; masking sky changes < 0.7 dB), so the PSNR gain should not be read as general. At 5 cm tolerance almost no
-1 m cell passes on either scene; the acceptance table only discriminates at 10–20 cm. Same-seed re-runs across
-machines moved the baseline by 0.12 m and the constrained run by 0.001 m, hence the multi-seed protocol.
-Not yet done: remaining seeds, the 76-view `facade` scene, training-time variants (`--depth_from`, `--splat 3`,
-`--lidar_voxel 0.05`), and aerial data (UAVScenes, M300 + Livox Avia, Terra-processed L1 reference).
+### Results (UAVScenes AMvalley01, aerial, seed 0)
+
+200 m × 200 m window, 120 images at 1/4 resolution (612 × 512, ~0.36 m ground sampling distance, ~130 m above ground),
+937 Avia scans → 3.18 M LiDAR points visible in at least two cameras; LiDAR repeatability (odd vs even scans) median
+0.14 m, p90 0.27 m, so tolerances are 0.3 / 0.5 / 1.0 m and the grid is 5 m. LiDAR depth covers 39 % of pixels here.
+
+| | photos only | + LiDAR depth, λ = 0.5 |
+|---|---|---|
+| test-view PSNR | 24.29 | 24.36 |
+| vs LiDAR: acc_mean / comp_mean (clipped 5 m) | 2.28 / 1.56 m | 0.82 / 0.56 m |
+| vs LiDAR: F-score @ 0.5 m | 0.363 | 0.622 |
+| vs LiDAR: test-view depth error | 4.66 m | 1.31 m |
+| vs LiDAR: 5 m cells passing at 0.5 m / 1.0 m (of 1936) | 17 / 338 | 285 / 1266 |
+| vs LiDAR: acc_mean, supervised / hidden blocks (10 m) | 1.493 / 1.496 m | 0.514 / 0.617 m |
+| vs DJI Terra map (never used in training): acc_mean / comp_mean | 3.00 / 1.31 m | 1.61 / 0.79 m |
+| vs DJI Terra map: F-score @ 0.3 m / 1.0 m | 0.171 / 0.371 | 0.160 / 0.536 |
+
+What the numbers do and do not say. With rendering quality unchanged on the aerial scene, geometry moves from metres
+to decimetres, and the gain is confirmed by a reference that took no part in training, but only at coarse tolerance:
+F-score at 0.3 m against the Terra map does not improve, the LiDAR surface sits a median 0.23 m above the Terra surface,
+and the LiDAR map itself repeats to 0.14 m. The hold-out shows that accuracy gains transfer to blocks without any LiDAR
+but are smaller there: hidden blocks trail supervised blocks by about 5 cm on courtyard, 7 cm on terrace and 10 cm on
+the aerial scene, while photo-only runs show no such gap on courtyard and the aerial scene (terrace's photo-only run
+has hidden blocks 5 cm better). Completeness transfers only partially (courtyard 0.081 vs 0.022 m). Block metrics count
+only reconstructed points inside blocks the reference occupies (32–45 % of the points for the photo-only courtyard
+runs), so they are not comparable with the all-points rows. Post-training floater pruning against the sparse LiDAR
+depth changes the metrics by < 0.01 m because only ~10 % of Gaussians fall on a LiDAR-covered pixel (negative result,
+kept). The ETH3D photo-only baseline is weak because these scenes are sparse-view (train PSNR 31–33 vs test 15–21;
+masking sky changes < 0.7 dB), so the PSNR gain there should not be read as general. At 5 cm tolerance almost no 1 m
+cell passes on either ETH3D scene; the acceptance table only discriminates at 10–20 cm. Between the two courtyard seeds
+the baseline moved by 0.12 m and the constrained run by 0.012 m.
+An earlier version of this section reported hidden-block accuracy equal to supervised-block accuracy; that came from a
+bug that drew the block split separately for the reconstruction and the reference, fixed in `gs/geometry.py` with a
+regression test; the runs reported here were re-scored from their saved point clouds.
+Not yet done: a second aerial seed and an aerial λ sweep, a third courtyard seed, terrace repeats, the 76-view `facade`
+scene, and training-time variants (`--depth_from`, `--splat 3`, `--lidar_voxel 0.05`).
 
 ```bash
 python tools/prepare_eth3d.py --raw raw/courtyard --out data/eth3d/courtyard --downscale 4 --gt_voxel 0.02
 python run_geometry.py --data data/eth3d/courtyard --out runs/courtyard_base --lambda_depth 0      # baseline
 python run_geometry.py --data data/eth3d/courtyard --out runs/courtyard_d0p5 --lambda_depth 0.5    # LiDAR-constrained
 python tools/aggregate_runs.py --root runs                                                          # mean ± s.d. table
+
+# aerial (UAVScenes run extracted to raw/AMvalley01)
+python tools/prepare_uavscenes.py --root raw/AMvalley01 --out data/uav/amvalley01_w200 --calib AMvalley --window 200 --max_images 120
+UAV="--block 10 --cell 5 --lidar_voxel 0.5 --fuse_voxel 0.1 --taus 0.2,0.3,0.5,1.0 --max_dist 5 --tolerance 0.5 --tolerances 0.3,0.5,1.0"
+python run_geometry.py --data data/uav/amvalley01_w200 --out runs/uav_d0p5 --lambda_depth 0.5 $UAV
+python run_geometry.py --data data/uav/amvalley01_w200 --out runs/uav_d0p5_vsTerra $UAV --eval_only --ply runs/uav_d0p5/point_cloud.ply \
+    --gt data/uav/amvalley01_w200/terra_ref.ply --split_ref data/uav/amvalley01_w200/gt_scan.ply                # second reference
 ```
 
 Outputs per run: `metrics.json` (image, geometry all / supervised / held-out, test-view depth, acceptance tables,
