@@ -12,6 +12,13 @@ reconstruction, after the bbox filter and any alignment). The reference is args.
 metrics.json is rewritten in place: geometry.supervised_blocks / heldout_blocks / split are replaced, the old values
 are kept under geometry.heldout_before_fix, and the file records rescored_heldout=true.
 
+Speed. The accuracy-side nearest-neighbour query is bounded at max_dist: a photo-only reconstruction has millions of
+points metres from the laser surface and an unbounded KD-tree query from each is slow (tens of minutes per run on a
+2-core VM). Every statistic run_geometry reports already clips distances at max_dist (mean, RMSE, F-scores at taus
+below max_dist, the beyond-max fraction), so they are unchanged; a median above max_dist is stored as null, and in the
+point-to-plane statistics points beyond max_dist count as max_dist (geometry_metrics would use the plane of a
+neighbour metres away).
+
     python tools/rescore_heldout.py /content/drive/MyDrive/gs_geometry/courtyard_*_s*
 """
 import argparse, json, os, sys
@@ -19,7 +26,11 @@ import argparse, json, os, sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gs.geometry import geometry_metrics, estimate_normals, blockwise_metrics  # noqa: E402
+from gs.geometry import estimate_normals, blockwise_metrics, nn_distances  # noqa: E402
+
+
+def finite_or_none(d):
+    return {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in d.items()} if d else d
 
 
 def main():
@@ -48,7 +59,14 @@ def main():
         split_ref = gt if os.path.abspath(split_path) == os.path.abspath(gt_path) else read(split_path)
         rec = read(need[2])
         taus = tuple(float(x) for x in args["taus"].split(","))
-        _, d_rec, d_ref, p2pl = geometry_metrics(rec, gt, taus, normals, args["max_dist"])
+        from scipy.spatial import cKDTree
+        if gt_path + "#tree" not in cache:
+            cache[gt_path + "#tree"] = cKDTree(gt)
+        d_rec, idx = cache[gt_path + "#tree"].query(rec, k=1, distance_upper_bound=args["max_dist"], workers=-1)
+        far = ~np.isfinite(d_rec)
+        idx[far] = 0
+        p2pl = np.abs(((rec - gt[idx]) * normals[idx]).sum(1)); p2pl[far] = np.inf
+        d_ref = nn_distances(gt, rec)
         new = blockwise_metrics(rec, gt, d_rec, d_ref, args["block"], args["lidar_holdout"], args["seed"], taus, p2pl,
                                 args["max_dist"], split_ref=split_ref)
         geo = m["geometry"]
@@ -56,6 +74,8 @@ def main():
             geo["heldout_before_fix"] = {k: geo.get(k) for k in ("supervised_blocks", "heldout_blocks")}
         for k in ("supervised_blocks", "heldout_blocks", "split"):
             geo.pop(k, None)
+        for k in ("supervised_blocks", "heldout_blocks"):
+            new[k] = finite_or_none(new.get(k))
         geo.update(new); m["rescored_heldout"] = True
         t = f"fscore@{taus[2]}" if len(taus) > 2 else f"fscore@{taus[-1]}"
         row = lambda d: f"acc {d['acc_mean']:.4f} comp {d['comp_mean']:.4f} {t} {d[t]:.3f}" if d else "-"
